@@ -19,7 +19,7 @@
 ## 使用
 
 ```cmd
-cd c:\Users\Zeeha\Documents\VSCode\新建文件夹
+cd c:\Users\User\Documents\VSCode\新建文件夹
 
 :: 交互式输入（推荐）：不带参数运行
 python tool.py
@@ -38,7 +38,7 @@ python tool.py "C:\path\to\input" "C:\path\to\output" --copy-others
 ```
 
 ## 路径与依赖提示
-- 路径可使用引号包裹以兼容空格，例如：`"C:\Users\Zeeha\Pictures Folder"`。脚本会自动去除首尾引号。
+- 路径可使用引号包裹以兼容空格，例如：`"C:\Users\User\Pictures Folder"`。脚本会自动去除首尾引号。
 - 脚本启动时会先检查 `ffmpeg` 是否已安装并在 `PATH` 中；未安装会循环提示输入路径。
 - `magick` (ImageMagick) 首选；找不到会自动回退到 `heif-enc` 或 `ffmpeg`。
 
@@ -69,3 +69,4 @@ python tool.py "C:\path\to\input" "C:\path\to\output" --copy-others
 - 原始 RAW 格式图片（如 `.nef`, `.cr2`）的转换支持取决于 `ffmpeg` 的解码能力；如遇到不支持的格式，请先转为常见格式再处理。
 - 某些容器格式视频在转换为 H.265 后会保持原扩展（如 `.mp4`/`.mkv`/`.mov`），其他扩展默认输出为 `.mp4`。
 - 如需保留音频编码不变，当前脚本已默认 `-c:a copy`；如不兼容，可改为 `-c:a aac`。
+
