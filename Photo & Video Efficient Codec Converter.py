@@ -48,6 +48,32 @@ def ensure_tool_available(name: str, fallback_path: str | None = None) -> bool:
     return shutil.which(name) is not None
 
 
+def copy_exif(source: Path, target: Path) -> bool:
+    # Use exiftool to copy all tags and set FileModifyDate from source.
+    # Two-step to avoid edge cases: copy tags, then sync FileModifyDate.
+    # 支持自定义 exiftool 路径（在 args 中或环境变量）
+    exiftool_bin = os.environ.get("EXIFTOOL_PATH", "exiftool")
+    if not ensure_tool_available("exiftool", exiftool_bin if exiftool_bin != "exiftool" else None):
+        print("[WARN] exiftool not found in PATH; skipping EXIF copy.")
+        return False
+    copy_cmd = [
+        exiftool_bin,
+        "-overwrite_original",
+        "-P",  # preserve file times of target when possible
+        f"-TagsFromFile={str(source)}",
+        str(target)
+    ]
+    code1 = run_cmd(copy_cmd)
+    sync_cmd = [
+        exiftool_bin,
+        "-overwrite_original",
+        f"-FileModifyDate<={str(source)}",
+        str(target)
+    ]
+    code2 = run_cmd(sync_cmd)
+    return code1 == 0 and code2 == 0
+
+
 def set_mtime_like_source(source: Path, target: Path) -> None:
     try:
         stat = source.stat()
@@ -63,7 +89,7 @@ def ffmpeg_supports_heic(ffmpeg_bin: str) -> bool:
     return "heic" in out.lower()
 
 
-def convert_image_to_heic(src: Path, dst: Path, quality: int = 30, preset: str = "medium", ffmpeg_bin: str = "ffmpeg", magick_bin: str = "magick") -> bool:
+def convert_image_to_heic(src: Path, dst: Path, quality: int = 30, preset: str = "medium", ffmpeg_bin: str = "ffmpeg", magick_bin: str = "magick") -> tuple[bool, str]:
     # 优先使用指定或默认的 magick_bin -> heif-enc -> ffmpeg
     if ensure_tool_available("magick", magick_bin if magick_bin != "magick" else None):
         q = max(10, min(95, 70 - (quality - 18)))
@@ -74,7 +100,8 @@ def convert_image_to_heic(src: Path, dst: Path, quality: int = 30, preset: str =
             "-define", "heic:speed=5",
             str(dst)
         ]
-        return run_cmd(cmd) == 0
+        ok = run_cmd(cmd) == 0
+        return ok, "magick"
     if ensure_tool_available("heif-enc"):
         q = max(10, min(95, 70 - (quality - 18)))
         cmd = [
@@ -83,7 +110,8 @@ def convert_image_to_heic(src: Path, dst: Path, quality: int = 30, preset: str =
             str(src),
             "-o", str(dst)
         ]
-        return run_cmd(cmd) == 0
+        ok = run_cmd(cmd) == 0
+        return ok, "heif-enc"
     if ffmpeg_supports_heic(ffmpeg_bin):
         cmd = [
             ffmpeg_bin, "-y",
@@ -96,9 +124,10 @@ def convert_image_to_heic(src: Path, dst: Path, quality: int = 30, preset: str =
             "-f", "heic",
             str(dst)
         ]
-        return run_cmd(cmd) == 0
+        ok = run_cmd(cmd) == 0
+        return ok, "ffmpeg"
     print("[ERR] 无法输出 HEIC：未检测到 magick / heif-enc，且 ffmpeg 不支持 heic muxer。")
-    return False
+    return False, "none"
 
 
 def is_video_h265(src: Path, ffmpeg_bin: str = "ffmpeg") -> bool:
@@ -228,7 +257,7 @@ def process_file(src: Path, in_root: Path, out_root: Path, args) -> None:
             return
         ffmpeg_bin = getattr(args, 'ffmpeg', 'ffmpeg')
         magick_bin = getattr(args, 'magick', 'magick')
-        ok = convert_image_to_heic(src, dst, quality=args.image_crf, preset=args.video_preset, ffmpeg_bin=ffmpeg_bin, magick_bin=magick_bin)
+        ok, backend = convert_image_to_heic(src, dst, quality=args.image_crf, preset=args.video_preset, ffmpeg_bin=ffmpeg_bin, magick_bin=magick_bin)
     elif is_video(src):
         # Normalize container to .mp4 for better compatibility
         out_ext = ".mp4"
@@ -255,6 +284,11 @@ def process_file(src: Path, in_root: Path, out_root: Path, args) -> None:
             return
 
     if ok:
+        # 若使用 magick，则通常已迁移 EXIF；此时跳过 exiftool 拷贝
+        if 'backend' in locals() and backend == 'magick':
+            pass
+        else:
+            copy_exif(src, dst)
         set_mtime_like_source(src, dst)
         print(f"[OK] {rel} -> {dst.relative_to(out_root)}")
     else:
@@ -346,6 +380,10 @@ def interactive_prompt(args):
     ffmpeg_path_input = input(f"ffmpeg 可执行路径（留空使用 PATH；默认 {ffmpeg_default or 'PATH'}）：").strip()
     ffmpeg_path_input = ffmpeg_path_input or ffmpeg_default or ""
 
+    exiftool_default = os.environ.get("EXIFTOOL_PATH", "")
+    exiftool_path_input = input(f"exiftool 可执行路径（留空使用 PATH；默认 {exiftool_default or 'PATH'}）：").strip()
+    exiftool_path_input = exiftool_path_input or exiftool_default or ""
+
     # Fill back to args
     args.input = in_dir
     args.output = out_dir
@@ -356,6 +394,7 @@ def interactive_prompt(args):
     args.copy_others = copy_others
     args.dry_run = dry_run
     args.ffmpeg = ffmpeg_path_input
+    args.exiftool = exiftool_path_input
     return args
 
 
@@ -402,6 +441,27 @@ def main():
         print(f"[ERR] Input directory not found: {in_root}")
         sys.exit(2)
     out_root.mkdir(parents=True, exist_ok=True)
+
+    # 校验并循环询问 exiftool 直到找到（若用户需要 EXIF 复制）
+    exiftool_bin = (getattr(args, 'exiftool', '') or os.environ.get("EXIFTOOL_PATH", '') or "exiftool").strip()
+    if not ensure_tool_available("exiftool", exiftool_bin if exiftool_bin != "exiftool" else None):
+        print("[WARN] exiftool 未找到。将尝试询问路径；若仍不可用，则跳过 EXIF 复制。")
+        while True:
+            try:
+                new_exif = input("请提供 exiftool 可执行路径（如 C:\\exiftool\\exiftool.exe），或回车跳过 EXIF：").strip()
+            except EOFError:
+                new_exif = ""
+            if not new_exif:
+                print("[WARN] EXIF 复制将被跳过。")
+                # 清空以便 copy_exif 判断不到时直接跳过
+                args.exiftool = ""
+                break
+            elif ensure_tool_available("exiftool", new_exif):
+                args.exiftool = new_exif
+                exiftool_bin = new_exif
+                break
+            else:
+                print("[ERR] 路径不可用，请重试。")
 
     files = gather_files(in_root)
     if args.dry_run:
