@@ -2,7 +2,7 @@
 
 解决手机图片视频占用太多的问题。
 
-将原始目录中的图片转换为 HEIC，视频转换为 H.265 (HEVC)，并将输出文件的修改时间设为源文件的修改时间，同时使用 `exiftool`迁移 EXIF 元数据。
+将原始目录中的图片转换为 HEIC，视频转换为 H.265 (HEVC)，并将输出文件的修改时间设为源文件的修改时间，同时自带迁移 EXIF 元数据。
 
 ## 功能
 - 图片 -> HEIC（ImageMagick `magick` 优先，回退 `heif-enc` 或 `ffmpeg`）
@@ -69,4 +69,5 @@ python tool.py "C:\path\to\input" "C:\path\to\output" --copy-others
 - 原始 RAW 格式图片（如 `.nef`, `.cr2`）的转换支持取决于 `ffmpeg` 的解码能力；如遇到不支持的格式，请先转为常见格式再处理。
 - 某些容器格式视频在转换为 H.265 后会保持原扩展（如 `.mp4`/`.mkv`/`.mov`），其他扩展默认输出为 `.mp4`。
 - 如需保留音频编码不变，当前脚本已默认 `-c:a copy`；如不兼容，可改为 `-c:a aac`。
+
 
