@@ -458,13 +458,50 @@ def interactive_prompt(args):
     copy_others = prompt_bool("是否复制非媒体文件", args.copy_others)
     skip_convert = prompt_bool("是否跳过转换,仅修改时间和元数据", args.skip_convert)
 
+    # 仅在不可用时才询问路径：ffmpeg
     ffmpeg_default = os.environ.get("FFMPEG_PATH", "")
-    ffmpeg_path_input = input(f"ffmpeg 可执行路径（留空使用 PATH；默认 {ffmpeg_default or 'PATH'}）：").strip()
-    ffmpeg_path_input = ffmpeg_path_input or ffmpeg_default or ""
-
-    exiftool_default = os.environ.get("EXIFTOOL_PATH", "")
-    exiftool_path_input = input(f"exiftool 可执行路径（留空使用 PATH；默认 {exiftool_default or 'PATH'}）：").strip()
-    exiftool_path_input = exiftool_path_input or exiftool_default or ""
+    ffmpeg_candidate = (ffmpeg_default or "ffmpeg").strip()
+    if ensure_tool_available("ffmpeg", ffmpeg_candidate if ffmpeg_candidate != "ffmpeg" else None):
+        ffmpeg_path_input = ffmpeg_candidate if ffmpeg_default else ""  # 有环境变量则使用；否则留空表示 PATH
+    else:
+        ffmpeg_path_input = input(
+            f"ffmpeg 可执行路径（留空使用 PATH；默认 {ffmpeg_default or 'PATH'}）："
+        ).strip()
+        ffmpeg_path_input = ffmpeg_path_input or ffmpeg_default or ""
+    
+    # 根据源目录内容，按需询问图片相关工具
+    in_root_tmp = Path(in_dir)
+    has_images = any(is_image(p) for p in in_root_tmp.rglob('*') if p.is_file())
+    if has_images:
+        # 先检测 magick；若可用则无需 exiftool 询问（magick 会保留 EXIF）
+        magick_default = os.environ.get("MAGICK_PATH", "")
+        magick_candidate = (magick_default or "magick").strip()
+        if ensure_tool_available("magick", magick_candidate if magick_candidate != "magick" else None):
+            magick_path_input = magick_candidate if magick_default else ""
+            exiftool_path_input = os.environ.get("EXIFTOOL_PATH", "")  # 保持为空或环境值，不主动询问
+        else:
+            # magick 不可用时，按需询问 magick 路径；若仍不可用，将使用 heif-enc/ffmpeg 回退，且需要 exiftool 复制 EXIF
+            try:
+                magick_path_input = input(
+                    f"magick 可执行路径（留空使用 PATH；默认 {magick_default or 'PATH'}）："
+                ).strip()
+            except EOFError:
+                magick_path_input = ""
+            magick_path_input = magick_path_input or magick_default or ""
+            # 如果依然不可用，则询问 exiftool 以便图片 EXIF 复制
+            exiftool_default = os.environ.get("EXIFTOOL_PATH", "")
+            exiftool_candidate = (exiftool_default or "exiftool").strip()
+            if ensure_tool_available("exiftool", exiftool_candidate if exiftool_candidate != "exiftool" else None):
+                exiftool_path_input = exiftool_candidate if exiftool_default else ""
+            else:
+                exiftool_path_input = input(
+                    f"exiftool 可执行路径（留空使用 PATH；默认 {exiftool_default or 'PATH'}）："
+                ).strip()
+                exiftool_path_input = exiftool_path_input or exiftool_default or ""
+    else:
+        # 无图片时，不询问 magick/exiftool
+        magick_path_input = os.environ.get("MAGICK_PATH", "") or ""
+        exiftool_path_input = os.environ.get("EXIFTOOL_PATH", "") or ""
 
     # Fill back to args
     args.input = in_dir
@@ -477,6 +514,7 @@ def interactive_prompt(args):
     args.skip_convert = skip_convert
     args.ffmpeg = ffmpeg_path_input
     args.exiftool = exiftool_path_input
+    args.magick = magick_path_input
     return args
 
 
@@ -524,28 +562,30 @@ def main():
         sys.exit(2)
     out_root.mkdir(parents=True, exist_ok=True)
 
-    # 校验并循环询问 exiftool 直到找到（若用户需要 EXIF 复制）
-    exiftool_bin = (getattr(args, 'exiftool', '') or os.environ.get("EXIFTOOL_PATH", '') or "exiftool").strip()
-    if not ensure_tool_available("exiftool", exiftool_bin if exiftool_bin != "exiftool" else None):
-        print("[WARN] exiftool 未找到。将尝试询问路径；若仍不可用，则跳过 EXIF 复制。")
-        while True:
-            try:
-                new_exif = input("请提供 exiftool 可执行路径（如 C:\\exiftool\\exiftool.exe），或回车跳过 EXIF：").strip()
-            except EOFError:
-                new_exif = ""
-            if not new_exif:
-                print("[WARN] EXIF 复制将被跳过。")
-                # 清空以便 copy_exif 判断不到时直接跳过
-                args.exiftool = ""
-                break
-            elif ensure_tool_available("exiftool", new_exif):
-                args.exiftool = new_exif
-                exiftool_bin = new_exif
-                break
-            else:
-                print("[ERR] 路径不可用，请重试。")
-
+    # 先收集文件列表，再按需询问 exiftool（避免未定义变量）
     files = gather_files(in_root)
+    # 仅在确实需要时才询问 exiftool：当存在图片且 magick 不可用时
+    exiftool_bin = (getattr(args, 'exiftool', '') or os.environ.get("EXIFTOOL_PATH", '') or "exiftool").strip()
+    has_images = any(is_image(f) for f in files)
+    if has_images and not ensure_tool_available("magick", magick_bin if magick_bin != "magick" else None):
+        if not ensure_tool_available("exiftool", exiftool_bin if exiftool_bin != "exiftool" else None):
+            print("[WARN] exiftool 未找到。将尝试询问路径；若仍不可用，则跳过 EXIF 复制。")
+            while True:
+                try:
+                    new_exif = input("请提供 exiftool 可执行路径（如 C:\\exiftool\\exiftool.exe），或回车跳过 EXIF：").strip()
+                except EOFError:
+                    new_exif = ""
+                if not new_exif:
+                    print("[WARN] EXIF 复制将被跳过。")
+                    # 清空以便 copy_exif 判断不到时直接跳过
+                    args.exiftool = ""
+                    break
+                elif ensure_tool_available("exiftool", new_exif):
+                    args.exiftool = new_exif
+                    exiftool_bin = new_exif
+                    break
+                else:
+                    print("[ERR] 提供的路径不可用，请重试。")
 
     # 若存在图片且 magick 不可用,允许循环输入 magick 路径或直接使用回退
     has_images = any(is_image(f) for f in files)
