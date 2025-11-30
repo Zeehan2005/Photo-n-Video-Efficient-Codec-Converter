@@ -2,14 +2,17 @@
 
 解决手机图片视频占用太多的问题。
 
-将原始目录中的图片转换为 HEIC，视频转换为 H.265 (HEVC)，并将输出文件的修改时间设为源文件的修改时间，同时使用 `exiftool`迁移 EXIF 元数据。
+将原始目录中的图片转换为 HEIC，视频转换为 H.265 (HEVC)，并将输出文件的修改时间设为源文件的修改时间，同时精确复制元数据。
 
 ## 功能
-- 图片 -> HEIC（`magick`）
+- 图片 -> HEIC（优先使用 `magick`）
 - 视频 -> H.265/HEVC（`ffmpeg`）
-- 复制 EXIF 元数据（`exiftool`）
+- 精确复制元数据：
+  - 图片使用 `exiftool` 复制 EXIF 元数据
+  - 视频使用 `ffmpeg -map_metadata` 精确保留所有元数据（包括 GPS 坐标、设备信息等）
 - 输出文件修改时间与源文件一致
 - 保持目录结构、可选择覆盖已有文件、可选择复制其他文件
+- 跳过转换模式 - 仅更新已存在文件的时间和元数据，不进行格式转换
 
 ## 前置依赖
 - Windows：请安装并将以下工具加入 PATH：
@@ -23,19 +26,19 @@
 cd c:\Users\User\Documents\VSCode\新建文件夹
 
 :: 交互式输入（推荐）：不带参数运行
-python tool.py
-
-:: 仅查看计划（不执行）
-python tool.py "C:\path\to\input" "C:\path\to\output" --dry-run
+python "Photo & Video Efficient Codec Converter.py"
 
 :: 实际转换，覆盖已存在的输出文件
-python tool.py "C:\path\to\input" "C:\path\to\output" --overwrite
+python "Photo & Video Efficient Codec Converter.py" "C:\path\to\input" "C:\path\to\output" --overwrite
+
+:: 跳过转换，仅更新已存在文件的时间和元数据（需配合 --overwrite 使用）
+python "Photo & Video Efficient Codec Converter.py" "C:\path\to\input" "C:\path\to\output" --skip-convert --overwrite
 
 :: 调整质量参数
-python tool.py "C:\path\to\input" "C:\path\to\output" --image-crf 28 --video-crf 22 --video-preset slow
+python "Photo & Video Efficient Codec Converter.py" "C:\path\to\input" "C:\path\to\output" --image-crf 28 --video-crf 22 --video-preset slow
 
 :: 复制非媒体文件
-python tool.py "C:\path\to\input" "C:\path\to\output" --copy-others
+python "Photo & Video Efficient Codec Converter.py" "C:\path\to\input" "C:\path\to\output" --copy-others
 ```
 
 ## 路径与依赖提示
@@ -56,15 +59,22 @@ python tool.py "C:\path\to\input" "C:\path\to\output" --copy-others
 
 ## 环境变量（可选）
 - `FFMPEG_PATH`：指定 ffmpeg 可执行文件路径，例如：`C:\ffmpeg\bin\ffmpeg.exe`
+- `MAGICK_PATH`：指定 ImageMagick 可执行文件路径，例如：`C:\Program Files\ImageMagick-7.1.1-Q16-HDRI\magick.exe`
 - `EXIFTOOL_PATH`：指定 exiftool 可执行文件路径，例如：`C:\exiftool\exiftool.exe`
 
-脚本在找不到可执行时会进入交互式循环，提示输入路径；对于 `exiftool`，也可选择回车跳过 EXIF 复制。
+脚本在找不到可执行时会进入交互式循环，提示输入路径；对于 `exiftool` 和 `magick`，也可选择回车跳过或使用回退方案。
 
 ## 说明
-- HEIC 编码：使用 `ffmpeg -c:v hevc -f heic`，并设置 `-crf` 控制质量（数值越低质量越好，体积越大）。
-- H.265 编码：使用 `libx265`，默认 `-crf 23 -preset medium`，可按需求调整。
-- EXIF 迁移：通过 `exiftool -TagsFromFile` 将源文件的元数据复制到目标文件。若 `exiftool` 未安装，脚本将跳过此步骤。若使用 ImageMagick（`magick`）进行 HEIC 编码，通常会保留/迁移原图的 EXIF 元数据，脚本将不再调用 `exiftool` 以避免重复处理。
-- 修改时间：通过 Python 的 `os.utime` 将输出文件的修改时间设为源文件的修改时间。
+- **HEIC 编码**：优先使用 ImageMagick (`magick`)，回退到 `heif-enc` 或 `ffmpeg -c:v hevc -f heic`，使用 `-crf` 控制质量（数值越低质量越好，体积越大）。
+- **H.265 编码**：使用 `ffmpeg` 的 `libx265`，默认 `-crf 23 -preset medium`，可按需求调整。转换前会自动检测视频是否已是 H.265 编码，如是则跳过转换。
+- **元数据迁移**：
+  - **图片**：通过 `exiftool -TagsFromFile` 复制 EXIF 元数据。若使用 ImageMagick（`magick`）进行 HEIC 编码，会自动迁移元数据，无需再调用 `exiftool`。
+  - **视频**：使用 `ffmpeg -map_metadata` 在转换时直接复制所有元数据，确保 GPS 坐标、设备信息等精确保留，不会出现精度丢失或格式变化。
+- **跳过转换模式** (`--skip-convert`)：
+  - 不进行格式转换，仅更新目标目录中已存在文件的时间和元数据
+  - 需配合 `--overwrite` 使用才会更新；若 `overwrite=否`，则完全跳过不做任何操作
+  - 适用场景：已完成转换，仅需批量修正时间戳或元数据
+- **修改时间**：通过 Python 的 `os.utime` 将输出文件的修改时间设为源文件的修改时间。
 
 ## 注意
 - 原始 RAW 格式图片（如 `.nef`, `.cr2`）的转换支持取决于 `ffmpeg` 的解码能力；如遇到不支持的格式，请先转为常见格式再处理。

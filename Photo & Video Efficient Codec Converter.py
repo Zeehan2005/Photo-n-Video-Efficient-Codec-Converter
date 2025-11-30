@@ -48,30 +48,62 @@ def ensure_tool_available(name: str, fallback_path: str | None = None) -> bool:
     return shutil.which(name) is not None
 
 
-def copy_exif(source: Path, target: Path) -> bool:
-    # Use exiftool to copy all tags and set FileModifyDate from source.
-    # Two-step to avoid edge cases: copy tags, then sync FileModifyDate.
-    # 支持自定义 exiftool 路径（在 args 中或环境变量）
+def copy_image_exif(source: Path, target: Path) -> bool:
+    """使用 exiftool 复制图片的 EXIF 元数据"""
     exiftool_bin = os.environ.get("EXIFTOOL_PATH", "exiftool")
     if not ensure_tool_available("exiftool", exiftool_bin if exiftool_bin != "exiftool" else None):
         print("[WARN] exiftool not found in PATH; skipping EXIF copy.")
         return False
+    
     copy_cmd = [
         exiftool_bin,
         "-overwrite_original",
-        "-P",  # preserve file times of target when possible
-        f"-TagsFromFile={str(source)}",
+        "-TagsFromFile", str(source),
+        "-all:all",
+        "-unsafe",
+        "-icc_profile",
         str(target)
     ]
-    code1 = run_cmd(copy_cmd)
-    sync_cmd = [
-        exiftool_bin,
-        "-overwrite_original",
-        f"-FileModifyDate<={str(source)}",
-        str(target)
-    ]
-    code2 = run_cmd(sync_cmd)
-    return code1 == 0 and code2 == 0
+    code = run_cmd(copy_cmd)
+    return code == 0
+
+
+def copy_video_metadata(source: Path, target: Path, ffmpeg_bin: str = "ffmpeg") -> bool:
+    """使用 ffmpeg 精确复制视频元数据到已存在的文件"""
+    # 创建临时文件用于重新封装
+    temp_file = target.parent / (target.stem + "_temp" + target.suffix)
+    
+    try:
+        # 使用 ffmpeg 复制所有流和元数据，不重新编码
+        cmd = [
+            ffmpeg_bin, "-y",
+            "-i", str(target),  # 输入是目标文件（已转换的视频）
+            "-i", str(source),  # 第二个输入是源文件（获取元数据）
+            "-map", "0",  # 使用第一个输入的所有流（视频/音频）
+            "-map_metadata", "1",  # 从第二个输入复制元数据
+            "-map_metadata:s:v", "1:s:v",  # 复制视频流元数据
+            "-map_metadata:s:a", "1:s:a",  # 复制音频流元数据
+            "-c", "copy",  # 不重新编码，仅复制
+            "-movflags", "use_metadata_tags",  # 使用元数据标签
+            str(temp_file)
+        ]
+        
+        code = run_cmd(cmd)
+        if code == 0:
+            # 替换原文件
+            target.unlink()
+            temp_file.rename(target)
+            return True
+        else:
+            # 清理临时文件
+            if temp_file.exists():
+                temp_file.unlink()
+            return False
+    except Exception as e:
+        print(f"[ERR] 复制视频元数据失败: {e}")
+        if temp_file.exists():
+            temp_file.unlink()
+        return False
 
 
 def set_mtime_like_source(source: Path, target: Path) -> None:
@@ -172,11 +204,15 @@ def convert_video_to_h265(src: Path, dst: Path, crf: int = 23, preset: str = "me
         ffmpeg_bin, "-y",
         "-progress", "pipe:1",  # 输出进度到 stdout
         "-i", str(src),
+        "-map_metadata", "0",  # 复制所有元数据
+        "-map_metadata:s:v", "0:s:v",  # 复制视频流元数据
+        "-map_metadata:s:a", "0:s:a",  # 复制音频流元数据
         "-c:v", "libx265",
         "-crf", str(crf),
         "-preset", preset,
         "-tag:v", "hvc1",
         "-c:a", "copy",
+        "-movflags", "use_metadata_tags",  # 保留元数据标签
         str(dst)
     ]
     
@@ -249,24 +285,58 @@ def process_file(src: Path, in_root: Path, out_root: Path, args) -> None:
     out_dir = out_root / rel.parent
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # 跳过转换模式:不复制不转换，仅更新元数据和时间
+    skip_convert = getattr(args, 'skip_convert', False)
+    
     if is_image(src):
-        out_ext = ".heic"
+        out_ext = ".heic" if not skip_convert else src.suffix
         dst = out_dir / (src.stem + out_ext)
-        if should_skip(src, dst, args.overwrite):
-            print(f"[SKIP] {rel} -> {dst.relative_to(out_root)}")
-            return
-        ffmpeg_bin = getattr(args, 'ffmpeg', 'ffmpeg')
-        magick_bin = getattr(args, 'magick', 'magick')
-        ok, backend = convert_image_to_heic(src, dst, quality=args.image_crf, preset=args.video_preset, ffmpeg_bin=ffmpeg_bin, magick_bin=magick_bin)
+        
+        # skip_convert 模式下的特殊处理
+        if skip_convert:
+            # 检查目标文件是否存在
+            if not dst.exists():
+                print(f"[ERR] 目标文件不存在，跳过: {dst}")
+                return
+            # 如果 overwrite=否，则不做任何操作
+            if not args.overwrite:
+                print(f"[SKIP] {rel} (skip_convert 且 overwrite=否)")
+                return
+            # overwrite=是，继续更新元数据
+            ok = True
+            backend = 'skip'
+        else:
+            # 正常转换模式
+            if should_skip(src, dst, args.overwrite):
+                print(f"[SKIP] {rel} -> {dst.relative_to(out_root)}")
+                return
+            ffmpeg_bin = getattr(args, 'ffmpeg', 'ffmpeg')
+            magick_bin = getattr(args, 'magick', 'magick')
+            ok, backend = convert_image_to_heic(src, dst, quality=args.image_crf, preset=args.video_preset, ffmpeg_bin=ffmpeg_bin, magick_bin=magick_bin)
     elif is_video(src):
         # Normalize container to .mp4 for better compatibility
-        out_ext = ".mp4"
+        out_ext = ".mp4" if not skip_convert else src.suffix
         dst = out_dir / (src.stem + out_ext)
-        if should_skip(src, dst, args.overwrite):
-            print(f"[SKIP] {rel} -> {dst.relative_to(out_root)}")
-            return
-        ffmpeg_bin = getattr(args, 'ffmpeg', 'ffmpeg')
-        ok = convert_video_to_h265(src, dst, crf=args.video_crf, preset=args.video_preset, ffmpeg_bin=ffmpeg_bin)
+        
+        # skip_convert 模式下的特殊处理
+        if skip_convert:
+            # 检查目标文件是否存在
+            if not dst.exists():
+                print(f"[ERR] 目标文件不存在，跳过: {dst}")
+                return
+            # 如果 overwrite=否，则不做任何操作
+            if not args.overwrite:
+                print(f"[SKIP] {rel} (skip_convert 且 overwrite=否)")
+                return
+            # overwrite=是，继续更新元数据
+            ok = True
+        else:
+            # 正常转换模式
+            if should_skip(src, dst, args.overwrite):
+                print(f"[SKIP] {rel} -> {dst.relative_to(out_root)}")
+                return
+            ffmpeg_bin = getattr(args, 'ffmpeg', 'ffmpeg')
+            ok = convert_video_to_h265(src, dst, crf=args.video_crf, preset=args.video_preset, ffmpeg_bin=ffmpeg_bin)
     else:
         # Copy non-media files as-is or skip
         if args.copy_others:
@@ -284,13 +354,25 @@ def process_file(src: Path, in_root: Path, out_root: Path, args) -> None:
             return
 
     if ok:
-        # 若使用 magick，则通常已迁移 EXIF；此时跳过 exiftool 拷贝
-        if 'backend' in locals() and backend == 'magick':
-            pass
-        else:
-            copy_exif(src, dst)
+        # 处理元数据复制
+        if is_image(src):
+            # 图片：若使用 magick 则已迁移 EXIF；若是 skip 模式需要显式复制
+            if 'backend' in locals() and backend == 'magick':
+                pass
+            else:
+                copy_image_exif(src, dst)
+        elif is_video(src):
+            # 视频：如果是 skip_convert 模式，需要使用 ffmpeg 复制元数据
+            if skip_convert:
+                ffmpeg_bin = getattr(args, 'ffmpeg', 'ffmpeg')
+                copy_video_metadata(src, dst, ffmpeg_bin)
+            # 否则转换时已通过 -map_metadata 复制了元数据
+        
         set_mtime_like_source(src, dst)
-        print(f"[OK] {rel} -> {dst.relative_to(out_root)}")
+        if skip_convert:
+            print(f"[UPDATE] {dst.relative_to(out_root)} 的时间和元数据已更新")
+        else:
+            print(f"[OK] {rel} -> {dst.relative_to(out_root)}")
     else:
         # Clean up partials
         try:
@@ -318,7 +400,7 @@ def parse_args():
     parser.add_argument("--video-crf", type=int, default=23, help="H.265 CRF")
     parser.add_argument("--video-preset", type=str, default="medium", help="H.265 preset (ultrafast..veryslow)")
     parser.add_argument("--copy-others", action="store_true", help="Copy non-media files as-is")
-    parser.add_argument("--dry-run", action="store_true", help="List planned operations without executing")
+    parser.add_argument("--skip-convert", action="store_true", help="Skip conversion, only update mtime and metadata")
     return parser.parse_args()
 
 
@@ -368,13 +450,13 @@ def interactive_prompt(args):
         return v.startswith('y')
 
     in_dir = prompt_dir("源输入")
-    out_dir = prompt_dir("输出")
+    out_dir = prompt_dir("新输出")
     image_crf = prompt_int("图片 CRF (质量，数字越低质量越好)", args.image_crf)
     video_crf = prompt_int("视频 CRF", args.video_crf)
     video_preset = prompt_choice("视频编码预设", ["ultrafast","superfast","veryfast","faster","fast","medium","slow","slower","veryslow"], args.video_preset)
     overwrite = prompt_bool("是否覆盖已存在的输出文件", args.overwrite)
     copy_others = prompt_bool("是否复制非媒体文件", args.copy_others)
-    dry_run = prompt_bool("仅干跑（不执行）", args.dry_run)
+    skip_convert = prompt_bool("是否跳过转换,仅修改时间和元数据", args.skip_convert)
 
     ffmpeg_default = os.environ.get("FFMPEG_PATH", "")
     ffmpeg_path_input = input(f"ffmpeg 可执行路径（留空使用 PATH；默认 {ffmpeg_default or 'PATH'}）：").strip()
@@ -392,7 +474,7 @@ def interactive_prompt(args):
     args.video_preset = video_preset
     args.overwrite = overwrite
     args.copy_others = copy_others
-    args.dry_run = dry_run
+    args.skip_convert = skip_convert
     args.ffmpeg = ffmpeg_path_input
     args.exiftool = exiftool_path_input
     return args
@@ -464,18 +546,8 @@ def main():
                 print("[ERR] 路径不可用，请重试。")
 
     files = gather_files(in_root)
-    if args.dry_run:
-        for f in files:
-            rel = f.relative_to(in_root)
-            if is_image(f):
-                print(f"[PLAN] IMAGE: {rel} -> {Path(rel.parent) / (f.stem + '.heic')}")
-            elif is_video(f):
-                print(f"[PLAN] VIDEO: {rel} -> {Path(rel.parent) / (f.stem + '.mp4')}")
-            elif args.copy_others:
-                print(f"[PLAN] COPY: {rel}")
-        return
 
-    # 若存在图片且 magick 不可用，允许循环输入 magick 路径或直接使用回退
+    # 若存在图片且 magick 不可用,允许循环输入 magick 路径或直接使用回退
     has_images = any(is_image(f) for f in files)
     if has_images and not ensure_tool_available("magick", magick_bin if magick_bin != "magick" else None):
         print("[INFO] 未检测到可用的 ImageMagick (magick)。可提供路径获得更佳 HEIC 编码；直接回车使用 heif-enc 或 ffmpeg 回退。")
